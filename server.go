@@ -70,6 +70,10 @@ type Upgrader struct {
 	// message compression (RFC 7692). Setting this value to true does not
 	// guarantee that compression will be supported. Currently only "no context
 	// takeover" modes are supported.
+	//
+	// A small compressed message can expand to roughly a thousand times its
+	// size. Use Conn.SetReadLimit to bound the size of messages read from
+	// the peer.
 	EnableCompression bool
 }
 
@@ -94,7 +98,7 @@ func checkSameOrigin(r *http.Request) bool {
 		return false
 	}
 	u, err := url.Parse(origin[0])
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil {
 		return false
 	}
 	return equalASCIIFold(u.Host, r.Host)
@@ -116,6 +120,60 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 	return ""
 }
 
+// checkCommon validates the parts of the handshake that are common to all HTTP
+// versions. On failure, it replies to the client and returns a non-nil error.
+func (u *Upgrader) checkCommon(w http.ResponseWriter, r *http.Request, responseHeader http.Header) error {
+	checkOrigin := u.CheckOrigin
+	if checkOrigin == nil {
+		checkOrigin = checkSameOrigin
+	}
+	var err error
+	switch {
+	case !tokenListContainsValue(r.Header, "Sec-Websocket-Version", "13"):
+		_, err = u.returnError(w, r, http.StatusBadRequest, "websocket: unsupported version: 13 not found in 'Sec-Websocket-Version' header")
+	case hasHeaderKey(responseHeader, "Sec-Websocket-Extensions"):
+		_, err = u.returnError(w, r, http.StatusInternalServerError, "websocket: application specific 'Sec-WebSocket-Extensions' headers are unsupported")
+	case !checkOrigin(r):
+		_, err = u.returnError(w, r, http.StatusForbidden, "websocket: request origin not allowed by Upgrader.CheckOrigin")
+	}
+	return err
+}
+
+// negotiateCompression reports whether permessage-deflate (RFC 7692) should
+// be used on the connection.
+func (u *Upgrader) negotiateCompression(r *http.Request) bool {
+	if u.EnableCompression {
+		for _, ext := range parseExtensions(r.Header) {
+			if ext[""] == "permessage-deflate" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasHeaderKey(h http.Header, key string) bool {
+	for k := range h {
+		if equalASCIIFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// isReservedResponseHeader reports whether k is a response header that the
+// application must not set because Upgrade sets it or it is specific to
+// HTTP/1.1 connection management.
+func isReservedResponseHeader(k string) bool {
+	return equalASCIIFold(k, "Sec-Websocket-Protocol") ||
+		equalASCIIFold(k, "Sec-Websocket-Accept") ||
+		equalASCIIFold(k, "Connection") ||
+		equalASCIIFold(k, "Keep-Alive") ||
+		equalASCIIFold(k, "Proxy-Connection") ||
+		equalASCIIFold(k, "Transfer-Encoding") ||
+		equalASCIIFold(k, "Upgrade")
+}
+
 // Upgrade upgrades the HTTP server connection to the WebSocket protocol.
 //
 // Upgrade supports HTTP/1.1 GET handshakes (RFC 6455) as well as HTTP/2
@@ -123,6 +181,20 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 // net/http HTTP/2 server, Extended CONNECT must be enabled via
 // http.HTTP2Config.EnableConnectProtocol (Go 1.28+) or GODEBUG=http2xconnect=1
 // / github.com/c2FmZQ/websocket/h2xconnect (Go 1.24–1.27).
+//
+// Unlike HTTP/1.1, an HTTP/2 or HTTP/3 WebSocket connection lives on the
+// handler's http.ResponseWriter, which is only valid until the handler
+// returns. The handler must call Conn.Close before returning; Serve does this
+// automatically. After Close returns, the connection never uses the
+// ResponseWriter again and its methods return net.ErrClosed, so goroutines
+// that still hold the connection are safe. Returning from the handler without
+// calling Close while another goroutine uses the connection is a data race
+// with the HTTP server.
+//
+// Any http.ResponseWriter middleware must implement
+// Unwrap() http.ResponseWriter so that http.ResponseController can manage
+// stream deadlines and flushing; otherwise Upgrade fails with
+// http.StatusInternalServerError for HTTP/2 and HTTP/3 requests.
 //
 // The responseHeader is included in the response to the client's upgrade
 // request. Use the responseHeader to specify cookies (Set-Cookie). To specify
@@ -149,20 +221,8 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		return u.returnError(w, r, http.StatusMethodNotAllowed, badHandshake+"request method is not GET")
 	}
 
-	if !tokenListContainsValue(r.Header, "Sec-Websocket-Version", "13") {
-		return u.returnError(w, r, http.StatusBadRequest, "websocket: unsupported version: 13 not found in 'Sec-Websocket-Version' header")
-	}
-
-	if _, ok := responseHeader["Sec-Websocket-Extensions"]; ok {
-		return u.returnError(w, r, http.StatusInternalServerError, "websocket: application specific 'Sec-WebSocket-Extensions' headers are unsupported")
-	}
-
-	checkOrigin := u.CheckOrigin
-	if checkOrigin == nil {
-		checkOrigin = checkSameOrigin
-	}
-	if !checkOrigin(r) {
-		return u.returnError(w, r, http.StatusForbidden, "websocket: request origin not allowed by Upgrader.CheckOrigin")
+	if err := u.checkCommon(w, r, responseHeader); err != nil {
+		return nil, err
 	}
 
 	challengeKey := r.Header.Get("Sec-Websocket-Key")
@@ -171,18 +231,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	}
 
 	subprotocol := u.selectSubprotocol(r, responseHeader)
-
-	// Negotiate PMCE
-	var compress bool
-	if u.EnableCompression {
-		for _, ext := range parseExtensions(r.Header) {
-			if ext[""] != "permessage-deflate" {
-				continue
-			}
-			compress = true
-			break
-		}
-	}
+	compress := u.negotiateCompression(r)
 
 	netConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -242,18 +291,31 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	p = append(p, "\r\n"...)
 	if c.subprotocol != "" {
 		p = append(p, "Sec-WebSocket-Protocol: "...)
-		p = append(p, c.subprotocol...)
+		for i := 0; i < len(c.subprotocol); i++ {
+			b := c.subprotocol[i]
+			if b <= 31 {
+				// prevent response splitting.
+				b = ' '
+			}
+			p = append(p, b)
+		}
 		p = append(p, "\r\n"...)
 	}
 	if compress {
 		p = append(p, "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n"...)
 	}
 	for k, vs := range responseHeader {
-		if k == "Sec-Websocket-Protocol" {
+		if isReservedResponseHeader(k) {
 			continue
 		}
 		for _, v := range vs {
-			p = append(p, k...)
+			for i := 0; i < len(k); i++ {
+				b := k[i]
+				if b <= 31 || b == ':' {
+					b = '-'
+				}
+				p = append(p, b)
+			}
 			p = append(p, ": "...)
 			for i := 0; i < len(v); i++ {
 				b := v[i]
@@ -293,6 +355,28 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	netConn = nil
 
 	return c, nil
+}
+
+// Serve upgrades the HTTP server connection to the WebSocket protocol, calls f
+// with the connection, and closes the connection when f returns. Call Serve
+// from an HTTP handler and return from the handler when Serve returns. This
+// enforces the connection lifetime required by HTTP/2 and HTTP/3 (see
+// Upgrade) and works the same way over HTTP/1.1.
+//
+// f must keep running for as long as the connection is in use. Goroutines
+// started by f may keep using the connection after f returns, in which case
+// their calls fail with net.ErrClosed.
+//
+// If the upgrade fails, Serve replies to the client with an HTTP error
+// response and returns the error without calling f.
+func (u *Upgrader) Serve(w http.ResponseWriter, r *http.Request, responseHeader http.Header, f func(*Conn)) error {
+	c, err := u.Upgrade(w, r, responseHeader)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	f(c)
+	return nil
 }
 
 // Upgrade upgrades the HTTP server connection to the WebSocket protocol.

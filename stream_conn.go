@@ -9,8 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,31 +24,6 @@ type stringAddr string
 
 func (a stringAddr) Network() string { return "tcp" }
 func (a stringAddr) String() string  { return string(a) }
-
-func parseIPZone(s string) (net.IP, string) {
-	ipStr, zone, _ := strings.Cut(s, "%")
-	return net.ParseIP(ipStr), zone
-}
-
-func parseRemoteAddr(addr string) net.Addr {
-	if host, portStr, err := net.SplitHostPort(addr); err == nil {
-		if ip, zone := parseIPZone(host); ip != nil {
-			port, _ := strconv.Atoi(portStr)
-			return &net.TCPAddr{IP: ip, Port: port, Zone: zone}
-		}
-	}
-	if ip, zone := parseIPZone(addr); ip != nil {
-		return &net.TCPAddr{IP: ip, Zone: zone}
-	}
-	return stringAddr(addr)
-}
-
-func localAddrFromRequest(r *http.Request) net.Addr {
-	if a, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && a != nil {
-		return a
-	}
-	return &net.TCPAddr{}
-}
 
 // extendedConnectProtocol extracts the Extended CONNECT :protocol token from an
 // HTTP/2 (RFC 8441) or HTTP/3 (RFC 9220) request.
@@ -69,15 +44,6 @@ func extendedConnectProtocol(r *http.Request) (string, bool) {
 	return "", false
 }
 
-func isForbiddenExtendedConnectRespHeader(k string) bool {
-	return equalASCIIFold(k, "Sec-Websocket-Protocol") ||
-		equalASCIIFold(k, "Connection") ||
-		equalASCIIFold(k, "Keep-Alive") ||
-		equalASCIIFold(k, "Proxy-Connection") ||
-		equalASCIIFold(k, "Transfer-Encoding") ||
-		equalASCIIFold(k, "Upgrade")
-}
-
 func (u *Upgrader) upgradeExtendedConnect(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (*Conn, error) {
 	const badHandshake = "websocket: the client is not using the websocket protocol: "
 
@@ -91,37 +57,31 @@ func (u *Upgrader) upgradeExtendedConnect(w http.ResponseWriter, r *http.Request
 	if r.Host == "" || strings.Contains(r.Host, "@") {
 		return u.returnError(w, r, http.StatusBadRequest, badHandshake+"missing or invalid ':authority' header")
 	}
-	proto, ok := extendedConnectProtocol(r)
-	if !ok || !equalASCIIFold(proto, "websocket") {
+	if proto, ok := extendedConnectProtocol(r); !ok || !equalASCIIFold(proto, "websocket") {
 		return u.returnError(w, r, http.StatusBadRequest, badHandshake+"':protocol' header must be 'websocket'")
 	}
-	if !tokenListContainsValue(r.Header, "Sec-Websocket-Version", "13") {
-		return u.returnError(w, r, http.StatusBadRequest, "websocket: unsupported version: 13 not found in 'Sec-Websocket-Version' header")
-	}
-	if _, ok := responseHeader["Sec-Websocket-Extensions"]; ok {
-		return u.returnError(w, r, http.StatusInternalServerError, "websocket: application specific 'Sec-WebSocket-Extensions' headers are unsupported")
+	if err := u.checkCommon(w, r, responseHeader); err != nil {
+		return nil, err
 	}
 
-	checkOrigin := u.CheckOrigin
-	if checkOrigin == nil {
-		checkOrigin = checkSameOrigin
+	// streamNetConn needs stream deadlines to implement timeouts and to
+	// unblock a pending write in Close. Without them, a peer that stops
+	// reading could block the connection forever. Deadlines are unavailable
+	// when middleware wraps the ResponseWriter without implementing
+	// Unwrap() http.ResponseWriter.
+	rc := http.NewResponseController(w)
+	var handshakeDeadline time.Time
+	if u.HandshakeTimeout > 0 {
+		handshakeDeadline = time.Now().Add(u.HandshakeTimeout)
 	}
-	if !checkOrigin(r) {
-		return u.returnError(w, r, http.StatusForbidden, "websocket: request origin not allowed by Upgrader.CheckOrigin")
+	// Clear the read deadline set by the HTTP server, like Hijack does for
+	// HTTP/1.1.
+	if err := errors.Join(rc.SetReadDeadline(time.Time{}), rc.SetWriteDeadline(handshakeDeadline)); err != nil {
+		return u.returnError(w, r, http.StatusInternalServerError, "websocket: response writer does not support deadlines: "+err.Error())
 	}
 
 	subprotocol := u.selectSubprotocol(r, responseHeader)
-
-	var compress bool
-	if u.EnableCompression {
-		for _, ext := range parseExtensions(r.Header) {
-			if ext[""] != "permessage-deflate" {
-				continue
-			}
-			compress = true
-			break
-		}
-	}
+	compress := u.negotiateCompression(r)
 
 	if subprotocol != "" {
 		w.Header().Set("Sec-WebSocket-Protocol", subprotocol)
@@ -130,7 +90,7 @@ func (u *Upgrader) upgradeExtendedConnect(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Sec-WebSocket-Extensions", "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
 	}
 	for k, vs := range responseHeader {
-		if isForbiddenExtendedConnectRespHeader(k) {
+		if isReservedResponseHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -138,26 +98,17 @@ func (u *Upgrader) upgradeExtendedConnect(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	rc := http.NewResponseController(w)
-	_ = rc.EnableFullDuplex()
-
-	if u.HandshakeTimeout > 0 {
-		if err := rc.SetWriteDeadline(time.Now().Add(u.HandshakeTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			return nil, err
-		}
-	}
 	w.WriteHeader(http.StatusOK)
-	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	if err := rc.Flush(); err != nil {
 		return nil, err
 	}
-	if u.HandshakeTimeout > 0 {
-		if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	if !handshakeDeadline.IsZero() {
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
 			return nil, err
 		}
 	}
 
-	sc := newStreamNetConn(r.Body, w, rc, localAddrFromRequest(r), parseRemoteAddr(r.RemoteAddr))
-	c := newConn(sc, true, u.ReadBufferSize, u.WriteBufferSize, u.WriteBufferPool, nil, nil)
+	c := newConn(newStreamNetConn(w, r), true, u.ReadBufferSize, u.WriteBufferSize, u.WriteBufferPool, nil, nil)
 	c.subprotocol = subprotocol
 	if compress {
 		c.newCompressionWriter = compressNoContextTakeover
@@ -168,9 +119,15 @@ func (u *Upgrader) upgradeExtendedConnect(w http.ResponseWriter, r *http.Request
 
 // streamNetConn adapts an HTTP/2 or HTTP/3 request/response stream to net.Conn.
 //
-// Lock order: Conn.mu -> writeMu -> rcMu (short non-blocking mutex).
-// Once Close() returns, closed is true and neither w nor rc will ever be
-// accessed again, allowing the caller's ServeHTTP handler to return safely.
+// The ResponseWriter is only valid until the handler returns, so the handler
+// must call Close before returning. After Close returns, w and rc are never
+// used again.
+//
+// Using w after the handler returned is a data race with the HTTP server that
+// this type cannot prevent. As a last resort, the panics that Go's HTTP/2
+// server raises in that case are turned into net.ErrClosed.
+//
+// Lock order: Conn.mu -> writeMu -> mu.
 type streamNetConn struct {
 	r          io.ReadCloser
 	w          http.ResponseWriter
@@ -178,15 +135,12 @@ type streamNetConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
-	deadlineMu    sync.Mutex
+	writeMu sync.Mutex // held for the duration of a write
+
+	mu            sync.Mutex
 	writeDeadline time.Time
-
-	writeMu sync.Mutex
-
-	rcMu     sync.Mutex
-	writing  bool
-	closed   bool
-	writeErr error
+	writing       bool
+	closed        bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -197,14 +151,33 @@ var (
 	_ buffersWriter = (*streamNetConn)(nil)
 )
 
-func newStreamNetConn(r io.ReadCloser, w http.ResponseWriter, rc *http.ResponseController, localAddr, remoteAddr net.Addr) *streamNetConn {
-	return &streamNetConn{
-		r:          r,
+func newStreamNetConn(w http.ResponseWriter, r *http.Request) *streamNetConn {
+	s := &streamNetConn{
+		r:          r.Body,
 		w:          w,
-		rc:         rc,
-		localAddr:  localAddr,
-		remoteAddr: remoteAddr,
+		rc:         http.NewResponseController(w),
+		localAddr:  &net.TCPAddr{},
+		remoteAddr: stringAddr(r.RemoteAddr),
 	}
+	if a, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && a != nil {
+		s.localAddr = a
+	}
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		s.remoteAddr = net.TCPAddrFromAddrPort(ap)
+	}
+	return s
+}
+
+// call runs f, which uses w or rc, and converts a panic into net.ErrClosed.
+// Go's HTTP/2 server panics when a ResponseWriter is used after its handler
+// returned, which would otherwise crash the process.
+func call(f func() error) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = net.ErrClosed
+		}
+	}()
+	return f()
 }
 
 func (s *streamNetConn) Read(p []byte) (int, error) {
@@ -222,79 +195,59 @@ func (s *streamNetConn) writeBuffers(bufs [][]byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	deadline := s.getWriteDeadline()
-
-	s.rcMu.Lock()
+	// HTTP/2 and HTTP/3 reset the stream when a write deadline expires, even
+	// if no write is in progress. The deadline is therefore only armed for
+	// the duration of each write.
+	s.mu.Lock()
 	if s.closed {
-		s.rcMu.Unlock()
+		s.mu.Unlock()
 		return net.ErrClosed
 	}
-	if s.writeErr != nil {
-		err := s.writeErr
-		s.rcMu.Unlock()
-		return err
-	}
-	armedDeadline := false
+	deadline := s.writeDeadline
 	if !deadline.IsZero() {
 		if deadline.Before(time.Now()) {
-			s.rcMu.Unlock()
+			s.mu.Unlock()
 			return os.ErrDeadlineExceeded
 		}
-		if err := s.rc.SetWriteDeadline(deadline); err != nil {
-			if !errors.Is(err, http.ErrNotSupported) {
-				s.writeErr = err
-				s.rcMu.Unlock()
-				return err
-			}
-		} else {
-			armedDeadline = true
+		if err := call(func() error { return s.rc.SetWriteDeadline(deadline) }); err != nil {
+			s.mu.Unlock()
+			return err
 		}
 	}
 	s.writing = true
-	s.rcMu.Unlock()
+	s.mu.Unlock()
 
-	var writeErr error
-	for _, buf := range bufs {
-		if len(buf) == 0 {
-			continue
+	err := call(func() error {
+		for _, buf := range bufs {
+			if _, err := s.w.Write(buf); err != nil {
+				return err
+			}
 		}
-		if _, err := s.w.Write(buf); err != nil {
-			writeErr = err
-			break
-		}
-	}
-	if writeErr == nil {
-		if err := s.rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			writeErr = err
-		}
-	}
+		return s.rc.Flush()
+	})
 
-	s.rcMu.Lock()
+	s.mu.Lock()
 	s.writing = false
-	if writeErr != nil {
-		if s.writeErr == nil {
-			s.writeErr = writeErr
-		}
-	} else if armedDeadline && !s.closed {
-		_ = s.rc.SetWriteDeadline(time.Time{})
+	if !deadline.IsZero() && !s.closed {
+		_ = call(func() error { return s.rc.SetWriteDeadline(time.Time{}) })
 	}
-	s.rcMu.Unlock()
-
-	return writeErr
+	s.mu.Unlock()
+	return err
 }
 
 func (s *streamNetConn) Close() error {
 	s.closeOnce.Do(func() {
-		s.rcMu.Lock()
-		s.closed = true
-		_ = s.rc.SetReadDeadline(time.Time{})
+		s.mu.Lock()
 		if s.writing {
-			_ = s.rc.SetWriteDeadline(time.Unix(1, 0))
+			// Abort the pending write.
+			_ = call(func() error { return s.rc.SetWriteDeadline(time.Unix(1, 0)) })
 		}
-		s.rcMu.Unlock()
+		s.closed = true
+		s.mu.Unlock()
 
 		s.closeErr = s.r.Close()
 
+		// Wait for a pending write to finish.
 		s.writeMu.Lock()
 		s.writeMu.Unlock()
 	})
@@ -305,48 +258,28 @@ func (s *streamNetConn) LocalAddr() net.Addr  { return s.localAddr }
 func (s *streamNetConn) RemoteAddr() net.Addr { return s.remoteAddr }
 
 func (s *streamNetConn) SetDeadline(t time.Time) error {
-	err1 := s.SetReadDeadline(t)
-	err2 := s.SetWriteDeadline(t)
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return errors.Join(s.SetReadDeadline(t), s.SetWriteDeadline(t))
 }
 
 func (s *streamNetConn) SetReadDeadline(t time.Time) error {
-	s.rcMu.Lock()
-	defer s.rcMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return net.ErrClosed
 	}
-	err := s.rc.SetReadDeadline(t)
-	if errors.Is(err, http.ErrNotSupported) {
-		return nil
-	}
-	return err
+	return call(func() error { return s.rc.SetReadDeadline(t) })
 }
 
 func (s *streamNetConn) SetWriteDeadline(t time.Time) error {
-	s.deadlineMu.Lock()
-	s.writeDeadline = t
-	s.deadlineMu.Unlock()
-
-	s.rcMu.Lock()
-	defer s.rcMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return net.ErrClosed
 	}
-	if !t.IsZero() && t.Before(time.Now()) && s.writing {
-		if err := s.rc.SetWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			return err
-		}
+	s.writeDeadline = t
+	if s.writing && !t.IsZero() && t.Before(time.Now()) {
+		// Abort the pending write.
+		return call(func() error { return s.rc.SetWriteDeadline(t) })
 	}
 	return nil
-}
-
-func (s *streamNetConn) getWriteDeadline() time.Time {
-	s.deadlineMu.Lock()
-	t := s.writeDeadline
-	s.deadlineMu.Unlock()
-	return t
 }

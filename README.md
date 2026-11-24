@@ -47,19 +47,21 @@ go get github.com/c2FmZQ/websocket
    mux.HandleFunc("CONNECT /ws", handleWS)
    ```
 
-3. **Handler lifetime:**
-   Over HTTP/2 and HTTP/3, the underlying stream is tied to the lifetime of `http.Handler.ServeHTTP`. Keep `ServeHTTP` active for the duration of the WebSocket session and close the connection before returning:
+3. **Handler lifetime (differs from `gorilla/websocket`):**
+   Over HTTP/2 and HTTP/3, the underlying stream is tied to the lifetime of `http.Handler.ServeHTTP`. The common gorilla pattern of starting read/write goroutines and returning from the handler does **not** work. Keep `ServeHTTP` active for the duration of the WebSocket session and close the connection before returning. `Upgrader.Serve` does both:
 
    ```go
    func handleWS(w http.ResponseWriter, r *http.Request) {
-       conn, err := upgrader.Upgrade(w, r, nil)
-       if err != nil {
-           return
-       }
-       defer conn.Close()
-       // Read/write using conn before returning from handleWS...
+       upgrader.Serve(w, r, nil, func(conn *websocket.Conn) {
+           // Read/write using conn. The connection is closed when this returns.
+       })
    }
    ```
+
+   After `Close` returns, the connection's methods return `net.ErrClosed`, so goroutines that still hold it are safe. Returning from the handler *without* calling `Close` while another goroutine uses the connection is a data race with the HTTP server.
+
+4. **Middleware:**
+   Any middleware that wraps `http.ResponseWriter` must implement `Unwrap() http.ResponseWriter` so that `http.ResponseController` can reach the stream's deadlines and flushing. Without deadlines, a peer could block the connection forever, so `Upgrade` rejects HTTP/2 and HTTP/3 requests with `500 Internal Server Error` when they are unavailable.
 
 ## License
 

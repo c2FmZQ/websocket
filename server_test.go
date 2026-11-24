@@ -91,6 +91,7 @@ var checkSameOriginTests = []struct {
 	r  *http.Request
 }{
 	{false, &http.Request{Host: "example.org", Header: map[string][]string{"Origin": {"https://other.org"}}}},
+	{false, &http.Request{Host: "example.org", Header: map[string][]string{"Origin": {"https://attacker.com@example.org"}}}},
 	{true, &http.Request{Host: "example.org", Header: map[string][]string{"Origin": {"https://example.org"}}}},
 	{true, &http.Request{Host: "Example.org", Header: map[string][]string{"Origin": {"https://example.org"}}}},
 }
@@ -167,5 +168,130 @@ func TestHijack_NotSupported(t *testing.T) {
 	if want := (HandshakeError{}); !errors.As(err, &want) || recorder.Code != http.StatusInternalServerError {
 		t.Errorf("want %T and status_code=%d", want, http.StatusInternalServerError)
 		t.Fatalf("got err=%T and status_code=%d", err, recorder.Code)
+	}
+}
+
+func TestUpgradeResponseHeaderSanitization(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	br := bufio.NewReader(strings.NewReader(""))
+	bw := bufio.NewWriter(&out)
+	rw := &captureHijackRW{buf: &out, brw: bufio.NewReadWriter(br, bw)}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "upgrade")
+	req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-Websocket-Version", "13")
+	req.Header.Set("Sec-Websocket-Protocol", "chat")
+
+	upgrader := Upgrader{
+		Subprotocols: []string{"chat"},
+	}
+	hdr := http.Header{
+		"sec-websocket-protocol": {"evil"},
+		"sec-websocket-accept":   {"bad-accept"},
+		"Connection":             {"close"},
+		"X-Bad\r\nInjected: 1":   {"val\r\nEvil: 2"},
+	}
+	c, err := upgrader.Upgrade(rw, req, hdr)
+	if err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	_ = c.Close()
+
+	raw := out.String()
+	if strings.Contains(raw, "evil") {
+		t.Errorf("non-canonical sec-websocket-protocol was not filtered: %q", raw)
+	}
+	if strings.Contains(raw, "bad-accept") {
+		t.Errorf("sec-websocket-accept was not filtered: %q", raw)
+	}
+	if strings.Contains(raw, "Connection: close") {
+		t.Errorf("forbidden Connection header was not filtered: %q", raw)
+	}
+	if strings.Contains(raw, "\r\nInjected:") || strings.Contains(raw, "\r\nEvil:") {
+		t.Errorf("header injection was not prevented: %q", raw)
+	}
+
+	// Verify subprotocol from responseHeader is sanitized when Subprotocols is nil.
+	out.Reset()
+	rw2 := &captureHijackRW{buf: &out, brw: bufio.NewReadWriter(bufio.NewReader(strings.NewReader("")), bufio.NewWriter(&out))}
+	c2, err := (&Upgrader{}).Upgrade(rw2, req, http.Header{
+		"Sec-Websocket-Protocol": {"chat\r\nEvil: 1"},
+	})
+	if err != nil {
+		t.Fatalf("Upgrade 2: %v", err)
+	}
+	_ = c2.Close()
+	if strings.Contains(out.String(), "\r\nEvil:") {
+		t.Errorf("subprotocol header injection was not prevented: %q", out.String())
+	}
+
+	// Verify non-canonical Sec-WebSocket-Extensions in responseHeader is rejected.
+	out.Reset()
+	rw3 := &captureHijackRW{buf: &out, brw: bufio.NewReadWriter(bufio.NewReader(strings.NewReader("")), bufio.NewWriter(&out))}
+	if _, err := (&Upgrader{Error: func(http.ResponseWriter, *http.Request, int, error) {}}).Upgrade(rw3, req, http.Header{
+		"Sec-WebSocket-Extensions": {"permessage-deflate"},
+	}); err == nil {
+		t.Fatal("expected error for non-canonical Sec-WebSocket-Extensions in responseHeader")
+	}
+}
+
+type captureHijackRW struct {
+	buf *bytes.Buffer
+	brw *bufio.ReadWriter
+	http.ResponseWriter
+}
+
+func (c *captureHijackRW) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return fakeNetConn{strings.NewReader(""), c.buf}, c.brw, nil
+}
+
+func TestUpgraderServe(t *testing.T) {
+	var upgrader Upgrader
+	serveErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveErr <- upgrader.Serve(w, r, nil, func(c *Conn) {
+			mt, p, err := c.ReadMessage()
+			if err == nil {
+				_ = c.WriteMessage(mt, p)
+			}
+		})
+	}))
+	defer srv.Close()
+
+	// Upgrade failure: f is not called and the client gets an error response.
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	var hsErr HandshakeError
+	if err := <-serveErr; !errors.As(err, &hsErr) {
+		t.Fatalf("Serve() error = %v, want HandshakeError", err)
+	}
+
+	// Success: the connection is closed when f returns.
+	var d Dialer
+	c, _, err := d.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.WriteMessage(TextMessage, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, p, err := c.ReadMessage(); err != nil || string(p) != "hello" {
+		t.Fatalf("ReadMessage() = (%q, %v), want hello", p, err)
+	}
+	if err := <-serveErr; err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	if _, _, err := c.ReadMessage(); err == nil {
+		t.Fatal("ReadMessage() after Serve returned: got nil error")
 	}
 }

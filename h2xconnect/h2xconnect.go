@@ -33,6 +33,9 @@
 //		_ "github.com/c2FmZQ/websocket/h2xconnect"
 //	)
 //
+// The setting applies to every net/http HTTP/2 server in the process, and child
+// processes inherit it through the environment.
+//
 // Starting in Go 1.28 (https://go.dev/issue/53208, golang/go commit
 // e29e95265674), net/http adds HTTP2Config.EnableConnectProtocol so servers can
 // opt in per http.Server without setting GODEBUG:

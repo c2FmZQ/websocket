@@ -7,20 +7,15 @@ package websocket
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -321,6 +316,11 @@ func TestExtendedConnectH2AndH3StreamFeatures(t *testing.T) {
 	}
 }
 
+func newTestStreamNetConn(w http.ResponseWriter, body io.ReadCloser) *streamNetConn {
+	r, _ := http.NewRequest(http.MethodConnect, "https://localhost/ws", body)
+	return newStreamNetConn(w, r)
+}
+
 type rwcNetConn struct {
 	r io.ReadCloser
 	w io.WriteCloser
@@ -395,7 +395,7 @@ func TestExtendedConnectValidationAndCloseSafety(t *testing.T) {
 		go io.Copy(io.Discard, sr)
 
 		mw := newMockStreamResponseWriter(sw)
-		sc := newStreamNetConn(cr, mw, http.NewResponseController(mw), &net.TCPAddr{}, &net.TCPAddr{})
+		sc := newTestStreamNetConn(mw, cr)
 		conn := newConn(sc, true, 1024, 1024, nil, nil, nil)
 		conn.SetReadLimit(65536)
 
@@ -420,7 +420,7 @@ func TestExtendedConnectValidationAndCloseSafety(t *testing.T) {
 		defer sr2.Close()
 		defer sw2.Close()
 		mw2 := newMockStreamResponseWriter(sw2)
-		sc2 := newStreamNetConn(cr2, mw2, http.NewResponseController(mw2), &net.TCPAddr{}, &net.TCPAddr{})
+		sc2 := newTestStreamNetConn(mw2, cr2)
 		conn2 := newConn(sc2, true, 1024, 1024, nil, nil, nil)
 		defer conn2.Close()
 
@@ -449,7 +449,7 @@ func TestExtendedConnectValidationAndCloseSafety(t *testing.T) {
 			go io.Copy(io.Discard, sr)
 
 			mw := newMockStreamResponseWriter(sw)
-			sc := newStreamNetConn(cr, mw, http.NewResponseController(mw), &net.TCPAddr{}, &net.TCPAddr{})
+			sc := newTestStreamNetConn(mw, cr)
 			conn := newConn(sc, true, 1024, 1024, nil, nil, nil)
 
 			var wg sync.WaitGroup
@@ -458,12 +458,13 @@ func TestExtendedConnectValidationAndCloseSafety(t *testing.T) {
 				defer wg.Done()
 				for range 20 {
 					_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-					_ = conn.SetWriteDeadline(time.Now().Add(-time.Millisecond))
 				}
 			}()
 			go func() {
 				defer wg.Done()
-				for range 20 {
+				for i := range 20 {
+					// SetWriteDeadline must not be called concurrently with other write methods.
+					_ = conn.SetWriteDeadline(time.Now().Add(time.Duration(i%2*2-1) * time.Millisecond))
 					_ = conn.WriteMessage(BinaryMessage, []byte("msg"))
 				}
 			}()
@@ -488,65 +489,160 @@ func TestExtendedConnectValidationAndCloseSafety(t *testing.T) {
 			_ = sw.Close()
 		}
 	})
+
+	t.Run("use_after_handler_exit_without_close", func(t *testing.T) {
+		cr, cw := io.Pipe()
+		sr, sw := io.Pipe()
+		defer cr.Close()
+		defer cw.Close()
+		defer sr.Close()
+		defer sw.Close()
+		go io.Copy(io.Discard, sr)
+
+		mw := newMockStreamResponseWriter(sw)
+		conn := newConn(newTestStreamNetConn(mw, cr), true, 1024, 1024, nil, nil, nil)
+		mw.handlerExited.Store(true) // the mock panics when used after this
+
+		if err := conn.WriteMessage(TextMessage, []byte("x")); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("WriteMessage = %v, want net.ErrClosed", err)
+		}
+		if err := conn.SetReadDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("SetReadDeadline = %v, want net.ErrClosed", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("Close = %v", err)
+		}
+	})
+}
+
+// reexecWithH2XConnect re-runs the current top-level test in a subprocess with
+// GODEBUG=http2xconnect=1, which enables HTTP/2 Extended CONNECT in net/http on
+// Go 1.24-1.27. It reports whether the caller should return.
+func reexecWithH2XConnect(t *testing.T) bool {
+	for _, part := range strings.Split(os.Getenv("GODEBUG"), ",") {
+		if strings.TrimSpace(part) == "http2xconnect=1" {
+			return false
+		}
+	}
+	godebug := "http2xconnect=1"
+	if v := os.Getenv("GODEBUG"); v != "" {
+		godebug = v + "," + godebug
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.v")
+	cmd.Env = append(os.Environ(), "GODEBUG="+godebug)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("subprocess failed: %v\n%s", err, out)
+	}
+	return true
+}
+
+// h2TestClient is a minimal HTTP/2 client that can send Extended CONNECT
+// requests.
+type h2TestClient struct {
+	t    *testing.T
+	conn *tls.Conn
+}
+
+func dialH2TestServer(t *testing.T, h http.Handler) *h2TestClient {
+	srv := httptest.NewUnstartedServer(h)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	conn, err := tls.Dial("tcp", srv.Listener.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	c := &h2TestClient{t: t, conn: conn}
+
+	if _, err := io.WriteString(conn, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	c.writeFrame(0x4, 0, 0, nil)
+	for {
+		typ, flags, _, p := c.readFrame()
+		if typ != 0x4 || flags&0x1 != 0 {
+			continue
+		}
+		gotXConnect := false
+		for i := 0; i+6 <= len(p); i += 6 {
+			if binary.BigEndian.Uint16(p[i:i+2]) == 0x8 && binary.BigEndian.Uint32(p[i+2:i+6]) == 1 {
+				gotXConnect = true
+			}
+		}
+		if !gotXConnect {
+			t.Fatal("missing ENABLE_CONNECT_PROTOCOL=1")
+		}
+		c.writeFrame(0x4, 0x1, 0, nil)
+		return c
+	}
+}
+
+func (c *h2TestClient) writeFrame(typ, flags byte, streamID uint32, p []byte) {
+	var h [9]byte
+	n := len(p)
+	h[0], h[1], h[2] = byte(n>>16), byte(n>>8), byte(n)
+	h[3], h[4] = typ, flags
+	binary.BigEndian.PutUint32(h[5:9], streamID)
+	if _, err := c.conn.Write(append(h[:], p...)); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+func (c *h2TestClient) readFrame() (typ, flags byte, streamID uint32, p []byte) {
+	var h [9]byte
+	if _, err := io.ReadFull(c.conn, h[:]); err != nil {
+		c.t.Fatal(err)
+	}
+	p = make([]byte, int(h[0])<<16|int(h[1])<<8|int(h[2]))
+	if _, err := io.ReadFull(c.conn, p); err != nil {
+		c.t.Fatal(err)
+	}
+	return h[3], h[4], binary.BigEndian.Uint32(h[5:9]) & 0x7fffffff, p
+}
+
+// connect sends an Extended CONNECT request for /ws on stream 1 and returns
+// the first byte of the response header block: 0x88 for :status 200 and 0x8e
+// for :status 500 (HPACK static table).
+func (c *h2TestClient) connect() byte {
+	// Literal HPACK headers without indexing.
+	var hb bytes.Buffer
+	for _, kv := range [][2]string{
+		{":method", "CONNECT"},
+		{":protocol", "websocket"},
+		{":scheme", "https"},
+		{":authority", c.conn.RemoteAddr().String()},
+		{":path", "/ws"},
+		{"sec-websocket-version", "13"},
+	} {
+		hb.WriteByte(0x00)
+		hb.WriteByte(byte(len(kv[0])))
+		hb.WriteString(kv[0])
+		hb.WriteByte(byte(len(kv[1])))
+		hb.WriteString(kv[1])
+	}
+	c.writeFrame(0x1, 0x4, 1, hb.Bytes())
+	for {
+		typ, _, sid, p := c.readFrame()
+		if typ == 0x1 && sid == 1 {
+			if len(p) == 0 {
+				c.t.Fatal("empty HEADERS frame")
+			}
+			return p[0]
+		}
+	}
 }
 
 func TestNetHTTP2EndToEnd(t *testing.T) {
-	hasSetting := false
-	for _, part := range strings.Split(os.Getenv("GODEBUG"), ",") {
-		if strings.TrimSpace(part) == "http2xconnect=1" {
-			hasSetting = true
-			break
-		}
-	}
-	if !hasSetting {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestNetHTTP2EndToEnd$", "-test.v")
-		env := make([]string, 0, len(os.Environ())+1)
-		found := false
-		for _, kv := range os.Environ() {
-			if strings.HasPrefix(kv, "GODEBUG=") {
-				v := strings.TrimPrefix(kv, "GODEBUG=")
-				if v == "" {
-					env = append(env, "GODEBUG=http2xconnect=1")
-				} else {
-					env = append(env, "GODEBUG="+v+",http2xconnect=1")
-				}
-				found = true
-				continue
-			}
-			env = append(env, kv)
-		}
-		if !found {
-			env = append(env, "GODEBUG=http2xconnect=1")
-		}
-		cmd.Env = env
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("subprocess failed: %v\n%s", err, out)
-		}
+	if reexecWithH2XConnect(t) {
 		return
 	}
-
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tlsCert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
-
 	upgrader := Upgrader{EnableCompression: true}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	c := dialH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -561,124 +657,17 @@ func TestNetHTTP2EndToEnd(t *testing.T) {
 				return
 			}
 		}
-	})
-
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"h2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	srv := &http.Server{Handler: mux}
-	defer srv.Shutdown(context.Background())
-	go srv.Serve(ln)
-
-	tconn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tconn.Close()
-
-	// Minimal HTTP/2 preface + SETTINGS exchange + Extended CONNECT stream 1
-	if _, err := io.WriteString(tconn, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"); err != nil {
-		t.Fatal(err)
-	}
-	writeRawH2Frame := func(typ, flags byte, streamID uint32, p []byte) error {
-		var h [9]byte
-		n := len(p)
-		h[0], h[1], h[2] = byte(n>>16), byte(n>>8), byte(n)
-		h[3], h[4] = typ, flags
-		binary.BigEndian.PutUint32(h[5:9], streamID)
-		if _, err := tconn.Write(h[:]); err != nil {
-			return err
-		}
-		_, err := tconn.Write(p)
-		return err
-	}
-	readRawH2Frame := func() (byte, byte, uint32, []byte, error) {
-		var h [9]byte
-		if _, err := io.ReadFull(tconn, h[:]); err != nil {
-			return 0, 0, 0, nil, err
-		}
-		n := int(h[0])<<16 | int(h[1])<<8 | int(h[2])
-		p := make([]byte, n)
-		if _, err := io.ReadFull(tconn, p); err != nil {
-			return 0, 0, 0, nil, err
-		}
-		return h[3], h[4], binary.BigEndian.Uint32(h[5:9]) & 0x7fffffff, p, nil
-	}
-
-	_ = writeRawH2Frame(0x4, 0, 0, nil)
-	for {
-		typ, flags, _, p, err := readRawH2Frame()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if typ == 0x4 && flags&0x1 == 0 {
-			gotXConnect := false
-			for i := 0; i+6 <= len(p); i += 6 {
-				if binary.BigEndian.Uint16(p[i:i+2]) == 0x8 && binary.BigEndian.Uint32(p[i+2:i+6]) == 1 {
-					gotXConnect = true
-				}
-			}
-			if !gotXConnect {
-				t.Fatal("missing ENABLE_CONNECT_PROTOCOL=1")
-			}
-			_ = writeRawH2Frame(0x4, 0x1, 0, nil)
-			break
-		}
-	}
-
-	// Literal HPACK headers without indexing: :method=CONNECT, :protocol=websocket, :scheme=https, :authority=..., :path=/ws, sec-websocket-version=13
-	var hb bytes.Buffer
-	putLit := func(k, v string) {
-		hb.WriteByte(0x00)
-		hb.WriteByte(byte(len(k)))
-		hb.WriteString(k)
-		hb.WriteByte(byte(len(v)))
-		hb.WriteString(v)
-	}
-	putLit(":method", "CONNECT")
-	putLit(":protocol", "websocket")
-	putLit(":scheme", "https")
-	putLit(":authority", ln.Addr().String())
-	putLit(":path", "/ws")
-	putLit("sec-websocket-version", "13")
-	if err := writeRawH2Frame(0x1, 0x4, 1, hb.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read 200 HEADERS (HPACK indexed :status 200 starts with 0x88)
-	for {
-		typ, _, sid, p, err := readRawH2Frame()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if typ == 0x1 && sid == 1 {
-			if len(p) == 0 || p[0] != 0x88 {
-				t.Fatalf("expected :status 200 (0x88), got %x", p)
-			}
-			break
-		}
+	}))
+	if status := c.connect(); status != 0x88 {
+		t.Fatalf("expected :status 200 (0x88), got %x", status)
 	}
 
 	// Echo binary WebSocket frame over HTTP/2 stream 1
 	wsMsg := []byte("hello over net/http h2")
-	if err := writeRawH2Frame(0x0, 0, 1, buildTestFrame(true, BinaryMessage, 0, true, wsMsg)); err != nil {
-		t.Fatal(err)
-	}
+	c.writeFrame(0x0, 0, 1, buildTestFrame(true, BinaryMessage, 0, true, wsMsg))
 	var dataBuf bytes.Buffer
 	for dataBuf.Len() < 2+len(wsMsg) {
-		typ, _, sid, p, err := readRawH2Frame()
-		if err != nil {
-			t.Fatal(err)
-		}
+		typ, _, sid, p := c.readFrame()
 		if typ == 0x0 && sid == 1 {
 			dataBuf.Write(p)
 		}
@@ -687,5 +676,160 @@ func TestNetHTTP2EndToEnd(t *testing.T) {
 	if err != nil || !fin || op != BinaryMessage || !bytes.Equal(gotPayload, wsMsg) {
 		t.Fatalf("echo = (%v, %d, %q, %v)", fin, op, gotPayload, err)
 	}
-	_ = writeRawH2Frame(0x0, 0x1, 1, buildTestFrame(true, CloseMessage, 0, true, FormatCloseMessage(CloseNormalClosure, "")))
+	c.writeFrame(0x0, 0x1, 1, buildTestFrame(true, CloseMessage, 0, true, FormatCloseMessage(CloseNormalClosure, "")))
+}
+
+// raceEnabled is set when the race detector is enabled.
+var raceEnabled bool
+
+// TestNetHTTP2HandlerReturnsEarly verifies that using a connection after the
+// handler returned without calling Close reports an error instead of crashing
+// the process. Go's HTTP/2 server panics when a ResponseWriter is used after
+// the handler returned. This misuse is inherently a data race with the HTTP
+// server, so the test can't run under the race detector.
+func TestNetHTTP2HandlerReturnsEarly(t *testing.T) {
+	if raceEnabled {
+		t.Skip("data race by design")
+	}
+	if reexecWithH2XConnect(t) {
+		return
+	}
+	var upgrader Upgrader
+	errs := make(chan error, 3)
+	c := dialH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		go func() {
+			<-r.Context().Done()
+			time.Sleep(50 * time.Millisecond) // let the server finish the handler
+			errs <- conn.WriteMessage(TextMessage, []byte("hello"))
+			errs <- conn.SetReadDeadline(time.Now().Add(time.Second))
+			errs <- conn.Close()
+		}()
+	}))
+	if status := c.connect(); status != 0x88 {
+		t.Fatalf("expected :status 200 (0x88), got %x", status)
+	}
+	for _, want := range []error{net.ErrClosed, net.ErrClosed, nil} {
+		if err := <-errs; !errors.Is(err, want) {
+			t.Fatalf("got %v, want %v", err, want)
+		}
+	}
+}
+
+// TestNetHTTP2ServeClosesBeforeReturn verifies that goroutines that outlive
+// the function passed to Upgrader.Serve get net.ErrClosed without racing with
+// the HTTP server.
+func TestNetHTTP2ServeClosesBeforeReturn(t *testing.T) {
+	if reexecWithH2XConnect(t) {
+		return
+	}
+	var upgrader Upgrader
+	errs := make(chan error, 1)
+	c := dialH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served := make(chan struct{})
+		defer close(served)
+		err := upgrader.Serve(w, r, nil, func(conn *Conn) {
+			go func() {
+				<-served
+				errs <- conn.WriteMessage(TextMessage, []byte("hello"))
+			}()
+		})
+		if err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	}))
+	if status := c.connect(); status != 0x88 {
+		t.Fatalf("expected :status 200 (0x88), got %x", status)
+	}
+	if err := <-errs; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteMessage after Serve returned = %v, want net.ErrClosed", err)
+	}
+}
+
+// TestNetHTTP2CloseAbortsWriteAfterContextCancel verifies that Close unblocks
+// a pending write when middleware has canceled the request context while the
+// handler is still running.
+func TestNetHTTP2CloseAbortsWriteAfterContextCancel(t *testing.T) {
+	if reexecWithH2XConnect(t) {
+		return
+	}
+	var upgrader Upgrader
+	results := make(chan string, 2)
+	c := dialH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context()) // e.g. timeout middleware
+		defer cancel()
+		r = r.WithContext(ctx)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade: %v", err)
+			return
+		}
+		writeDone := make(chan error, 1)
+		go func() {
+			// The client never sends WINDOW_UPDATE, so this blocks.
+			writeDone <- conn.WriteMessage(BinaryMessage, make([]byte, 1<<20))
+		}()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+
+		closeDone := make(chan struct{})
+		go func() {
+			conn.Close()
+			close(closeDone)
+		}()
+		select {
+		case <-closeDone:
+			results <- "closed"
+		case <-time.After(5 * time.Second):
+			results <- "Close blocked"
+			return
+		}
+		if err := <-writeDone; err == nil {
+			results <- "write succeeded"
+		} else {
+			results <- "write failed"
+		}
+	}))
+	if status := c.connect(); status != 0x88 {
+		t.Fatalf("expected :status 200 (0x88), got %x", status)
+	}
+	// Drain frames without granting flow-control credit.
+	go io.Copy(io.Discard, c.conn)
+	if got := <-results; got != "closed" {
+		t.Fatal(got)
+	}
+	if got := <-results; got != "write failed" {
+		t.Fatal(got)
+	}
+}
+
+// noUnwrapResponseWriter is typical logging middleware: it implements Flush
+// but not Unwrap, which hides the stream's deadlines.
+type noUnwrapResponseWriter struct{ http.ResponseWriter }
+
+func (w noUnwrapResponseWriter) Flush() { w.ResponseWriter.(http.Flusher).Flush() }
+
+func TestNetHTTP2RequiresDeadlines(t *testing.T) {
+	if reexecWithH2XConnect(t) {
+		return
+	}
+	var upgrader Upgrader
+	upgradeErr := make(chan error, 1)
+	c := dialH2TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(noUnwrapResponseWriter{w}, r, nil)
+		if err == nil {
+			conn.Close()
+		}
+		upgradeErr <- err
+	}))
+	if status := c.connect(); status != 0x8e {
+		t.Fatalf("expected :status 500 (0x8e), got %x", status)
+	}
+	if err := <-upgradeErr; err == nil || !strings.Contains(err.Error(), "deadlines") {
+		t.Fatalf("Upgrade error = %v, want deadline error", err)
+	}
 }

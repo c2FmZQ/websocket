@@ -232,8 +232,27 @@
 // Upgrader.Upgrade transparently accepts HTTP/1.1 GET upgrades (RFC 6455) as
 // well as HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) Extended CONNECT requests,
 // returning a *Conn in all cases. When using method-specific http.ServeMux
-// patterns, register both GET and CONNECT handlers for WebSocket routes, and
-// keep the http.Handler running for the lifetime of the WebSocket session.
+// patterns, register both GET and CONNECT handlers for WebSocket routes.
+//
+// Over HTTP/2 and HTTP/3, the connection is tied to the handler's
+// http.ResponseWriter. Unlike HTTP/1.1, the handler must keep running for the
+// lifetime of the WebSocket session and call Conn.Close before returning.
+// Upgrader.Serve does this:
+//
+//	func handler(w http.ResponseWriter, r *http.Request) {
+//	    upgrader.Serve(w, r, nil, func(conn *websocket.Conn) {
+//	        ... Use conn to send and receive messages.
+//	    })
+//	}
+//
+// After Close returns, the connection's methods return net.ErrClosed, so other
+// goroutines that still hold the connection are safe. Returning from the
+// handler without calling Close while another goroutine uses the connection
+// is a data race with the HTTP server.
+//
+// Middleware that wraps http.ResponseWriter must implement
+// Unwrap() http.ResponseWriter so that stream deadlines are available;
+// otherwise Upgrade fails.
 //
 // Go's standard library net/http server disables HTTP/2 Extended CONNECT by
 // default starting in Go 1.24:

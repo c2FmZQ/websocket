@@ -90,7 +90,10 @@ func (w *truncWriter) Write(p []byte) (int, error) {
 	copy(w.p[:], w.p[m:])
 	copy(w.p[len(w.p)-m:], p[len(p)-m:])
 	nn, err := w.w.Write(p[:len(p)-m])
-	return n + nn, err
+	if err != nil {
+		return n + nn, err
+	}
+	return n + len(p), nil
 }
 
 type flateWriteWrapper struct {
@@ -113,14 +116,15 @@ func (w *flateWriteWrapper) Close() error {
 	err1 := w.fw.Flush()
 	w.p.Put(w.fw)
 	w.fw = nil
-	if w.tw.p != [4]byte{0, 0, 0xff, 0xff} {
-		return errors.New("websocket: internal error, unexpected bytes at end of flate stream")
-	}
-	err2 := w.tw.w.Close()
 	if err1 != nil {
+		_ = w.tw.w.Close()
 		return err1
 	}
-	return err2
+	if w.tw.p != [4]byte{0, 0, 0xff, 0xff} {
+		_ = w.tw.w.Close()
+		return errors.New("websocket: internal error, unexpected bytes at end of flate stream")
+	}
+	return w.tw.w.Close()
 }
 
 type flateReadWrapper struct {

@@ -244,14 +244,13 @@ type Conn struct {
 	subprotocol string
 
 	// Write fields
-	mu              chan struct{} // used as mutex to protect write to conn
-	writeBuf        []byte        // frame is constructed in this buffer.
-	writePool       BufferPool
-	writeBufSize    int
-	writeDeadlineMu sync.Mutex
-	writeDeadline   time.Time
-	writer          io.WriteCloser // the current writer returned to the application
-	isWriting       bool           // for best-effort concurrent write detection
+	mu            chan struct{} // used as mutex to protect write to conn
+	writeBuf      []byte        // frame is constructed in this buffer.
+	writePool     BufferPool
+	writeBufSize  int
+	writeDeadline time.Time
+	writer        io.WriteCloser // the current writer returned to the application
+	isWriting     bool           // for best-effort concurrent write detection
 
 	writeErrMu sync.Mutex
 	writeErr   error
@@ -631,7 +630,7 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 	}
 	c.isWriting = true
 
-	err := c.write(w.frameType, c.getWriteDeadline(), c.writeBuf[framePos:w.pos], extra)
+	err := c.write(w.frameType, c.writeDeadline, c.writeBuf[framePos:w.pos], extra)
 
 	if !c.isWriting {
 		panic("concurrent write to websocket connection")
@@ -758,7 +757,7 @@ func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {
 		panic("concurrent write to websocket connection")
 	}
 	c.isWriting = true
-	err = c.write(frameType, c.getWriteDeadline(), frameData, nil)
+	err = c.write(frameType, c.writeDeadline, frameData, nil)
 	if !c.isWriting {
 		panic("concurrent write to websocket connection")
 	}
@@ -798,17 +797,8 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 // all future writes will return an error. A zero value for t means writes will
 // not time out.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.writeDeadlineMu.Lock()
 	c.writeDeadline = t
-	c.writeDeadlineMu.Unlock()
 	return nil
-}
-
-func (c *Conn) getWriteDeadline() time.Time {
-	c.writeDeadlineMu.Lock()
-	t := c.writeDeadline
-	c.writeDeadlineMu.Unlock()
-	return t
 }
 
 // Read methods
@@ -843,7 +833,7 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	c.readDecompress = false
 	if rsv1 {
-		if c.newDecompressionReader != nil {
+		if c.newDecompressionReader != nil && (frameType == TextMessage || frameType == BinaryMessage) {
 			c.readDecompress = true
 		} else {
 			errors = append(errors, "RSV1 set")
@@ -1045,6 +1035,13 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
+				if c.readLimit > 0 {
+					c.reader = &limitedDecompressReader{
+						c:         c,
+						rc:        c.reader,
+						remaining: c.readLimit,
+					}
+				}
 			}
 			return frameType, c.reader, nil
 		}
@@ -1114,6 +1111,41 @@ func (r *messageReader) Close() error {
 	return nil
 }
 
+type limitedDecompressReader struct {
+	c         *Conn
+	rc        io.ReadCloser
+	remaining int64
+}
+
+func (r *limitedDecompressReader) Read(p []byte) (int, error) {
+	if r.c.readErr != nil {
+		return 0, r.c.readErr
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.remaining == 0 {
+		var probe [1]byte
+		n, err := r.rc.Read(probe[:])
+		if n > 0 {
+			_ = r.c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
+			r.c.readErr = ErrReadLimit
+			return 0, ErrReadLimit
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.rc.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+func (r *limitedDecompressReader) Close() error {
+	return r.rc.Close()
+}
+
 // ReadMessage is a helper method for getting a reader using NextReader and
 // reading from that reader to a buffer.
 func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
@@ -1136,7 +1168,12 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetReadLimit sets the maximum size in bytes for a message read from the peer. If a
 // message exceeds the limit, the connection sends a close message to the peer
-// and returns ErrReadLimit to the application.
+// and returns ErrReadLimit to the application. When compression is in use, the
+// limit applies to both the compressed and the decompressed size.
+//
+// The default is no limit. Applications that read messages from untrusted
+// peers should set a limit, especially when compression is enabled: a small
+// compressed message can expand to roughly a thousand times its size.
 func (c *Conn) SetReadLimit(limit int64) {
 	c.readLimit = limit
 }

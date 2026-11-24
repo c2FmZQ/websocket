@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"unicode/utf8"
 )
 
 var keyGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
@@ -176,25 +175,22 @@ func nextTokenOrQuoted(s string) (value string, rest string) {
 // equalASCIIFold returns true if s is equal to t with ASCII case folding as
 // defined in RFC 4790.
 func equalASCIIFold(s, t string) bool {
-	for s != "" && t != "" {
-		sr, size := utf8.DecodeRuneInString(s)
-		s = s[size:]
-		tr, size := utf8.DecodeRuneInString(t)
-		t = t[size:]
-		if sr == tr {
-			continue
-		}
-		if 'A' <= sr && sr <= 'Z' {
-			sr = sr + 'a' - 'A'
-		}
-		if 'A' <= tr && tr <= 'Z' {
-			tr = tr + 'a' - 'A'
-		}
-		if sr != tr {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if toLowerASCII(s[i]) != toLowerASCII(t[i]) {
 			return false
 		}
 	}
-	return s == t
+	return true
+}
+
+func toLowerASCII(b byte) byte {
+	if 'A' <= b && b <= 'Z' {
+		return b + 'a' - 'A'
+	}
+	return b
 }
 
 // tokenListContainsValue returns true if the 1#token header with the given

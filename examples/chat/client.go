@@ -122,16 +122,16 @@ func (c *Client) writePump() {
 
 // serveWs handles websocket requests from the peer.
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Serve closes the connection and returns when the read pump returns.
+	// Over HTTP/2 and HTTP/3, the connection is only valid until the handler
+	// returns.
+	err := upgrader.Serve(w, r, nil, func(conn *websocket.Conn) {
+		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+		client.hub.register <- client
+		go client.writePump()
+		client.readPump()
+	})
 	if err != nil {
 		log.Println(err)
-		return
 	}
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
-	client.hub.register <- client
-
-	// Allow collection of memory referenced by the caller by doing all work in
-	// new goroutines.
-	go client.writePump()
-	go client.readPump()
 }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -24,6 +25,12 @@ import (
 var ErrBadHandshake = errors.New("websocket: bad handshake")
 
 var errInvalidCompression = errors.New("websocket: invalid compression negotiation")
+
+var errHandshakeResponseTooLarge = errors.New("websocket: handshake response too large")
+
+// maxHandshakeResponseSize is the maximum size of the HTTP response to a
+// handshake or proxy CONNECT request.
+const maxHandshakeResponseSize = 1 << 20
 
 // NewClient creates a new client connection using the given net connection.
 // The URL u specifies the host and request URI. Use requestHeader to specify
@@ -119,6 +126,10 @@ type Dialer struct {
 	// per message compression (RFC 7692). Setting this value to true does not
 	// guarantee that compression will be supported. Currently only "no context
 	// takeover" modes are supported.
+	//
+	// A small compressed message can expand to roughly a thousand times its
+	// size. Use Conn.SetReadLimit to bound the size of messages read from
+	// the peer.
 	EnableCompression bool
 
 	// Jar specifies the cookie jar.
@@ -231,20 +242,25 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		req.Header["Sec-WebSocket-Protocol"] = []string{strings.Join(d.Subprotocols, ", ")}
 	}
 	for k, vs := range requestHeader {
+		ck := http.CanonicalHeaderKey(k)
 		switch {
-		case k == "Host":
+		case ck == "Host":
 			if len(vs) > 0 {
 				req.Host = vs[0]
 			}
-		case k == "Upgrade" ||
-			k == "Connection" ||
-			k == "Sec-Websocket-Key" ||
-			k == "Sec-Websocket-Version" ||
-			k == "Sec-Websocket-Extensions" ||
-			(k == "Sec-Websocket-Protocol" && len(d.Subprotocols) > 0):
+		case ck == "Upgrade" ||
+			ck == "Connection" ||
+			ck == "Sec-Websocket-Key" ||
+			ck == "Sec-Websocket-Version" ||
+			ck == "Sec-Websocket-Extensions" ||
+			(ck == "Sec-Websocket-Protocol" && len(d.Subprotocols) > 0):
 			return nil, nil, errors.New("websocket: duplicate header not allowed: " + k)
-		case k == "Sec-Websocket-Protocol":
+		case ck == "Sec-Websocket-Protocol":
 			req.Header["Sec-WebSocket-Protocol"] = vs
+		case ck == "Content-Length" || ck == "Transfer-Encoding" || ck == "Trailer":
+			// Request.Write omits these headers only when their names are
+			// canonical. Drop them regardless of case so that they can't
+			// alter the request framing.
 		default:
 			req.Header[k] = vs
 		}
@@ -300,6 +316,9 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		}
 	}()
 
+	stopAbort := abortOnCancel(ctx, netConn)
+	defer stopAbort()
+
 	// Do TLS handshake over established connection if a proxy exists.
 	if proxyURL != nil && u.Scheme == "https" {
 
@@ -324,9 +343,13 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	conn := newConn(netConn, false, d.ReadBufferSize, d.WriteBufferSize, d.WriteBufferPool, nil, nil)
+	// Bound the size of the handshake response. The limit is lifted once the
+	// handshake succeeds.
+	limitedConn := &io.LimitedReader{R: netConn, N: maxHandshakeResponseSize}
+	conn.br.Reset(limitedConn)
 
 	if err := req.Write(netConn); err != nil {
-		return nil, nil, err
+		return nil, nil, ctxErrOr(ctx, err)
 	}
 
 	if trace != nil && trace.GotFirstResponseByte != nil {
@@ -336,6 +359,12 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	resp, err := http.ReadResponse(conn.br, req)
+	if err != nil && limitedConn.N <= 0 {
+		return nil, nil, errHandshakeResponseTooLarge
+	}
+	if err != nil && ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
 	if err != nil {
 		if d.TLSClientConfig != nil {
 			for _, proto := range d.TLSClientConfig.NextProtos {
@@ -370,7 +399,11 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		return nil, resp, ErrBadHandshake
 	}
 
-	for _, ext := range parseExtensions(resp.Header) {
+	exts := parseExtensions(resp.Header)
+	if !d.EnableCompression && len(exts) > 0 {
+		return nil, resp, errInvalidCompression
+	}
+	for _, ext := range exts {
 		if ext[""] != "permessage-deflate" {
 			continue
 		}
@@ -385,8 +418,12 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader([]byte{}))
+	limitedConn.N = math.MaxInt64
 	conn.subprotocol = resp.Header.Get("Sec-Websocket-Protocol")
 
+	if err := stopAbort(); err != nil {
+		return nil, resp, err
+	}
 	if err := netConn.SetDeadline(time.Time{}); err != nil {
 		return nil, resp, err
 	}
@@ -514,4 +551,28 @@ func doHandshake(ctx context.Context, tlsConn *tls.Conn, cfg *tls.Config) error 
 		}
 	}
 	return nil
+}
+
+// abortOnCancel interrupts I/O on conn when ctx is canceled. Dial functions
+// only honor ctx while connecting. The returned function stops the
+// interruption. It returns ctx's error if conn may have been interrupted, in
+// which case conn must not be used.
+func abortOnCancel(ctx context.Context, conn net.Conn) (stop func() error) {
+	stopFunc := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Unix(1, 0))
+	})
+	return func() error {
+		if !stopFunc() && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+}
+
+// ctxErrOr returns ctx's error if ctx is done, or err otherwise.
+func ctxErrOr(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
