@@ -244,13 +244,14 @@ type Conn struct {
 	subprotocol string
 
 	// Write fields
-	mu            chan struct{} // used as mutex to protect write to conn
-	writeBuf      []byte        // frame is constructed in this buffer.
-	writePool     BufferPool
-	writeBufSize  int
-	writeDeadline time.Time
-	writer        io.WriteCloser // the current writer returned to the application
-	isWriting     bool           // for best-effort concurrent write detection
+	mu              chan struct{} // used as mutex to protect write to conn
+	writeBuf        []byte        // frame is constructed in this buffer.
+	writePool       BufferPool
+	writeBufSize    int
+	writeDeadlineMu sync.Mutex
+	writeDeadline   time.Time
+	writer          io.WriteCloser // the current writer returned to the application
+	isWriting       bool           // for best-effort concurrent write detection
 
 	writeErrMu sync.Mutex
 	writeErr   error
@@ -405,6 +406,9 @@ func (c *Conn) write(frameType int, deadline time.Time, buf0, buf1 []byte) error
 }
 
 func (c *Conn) writeBufs(bufs ...[]byte) error {
+	if bw, ok := c.conn.(buffersWriter); ok {
+		return bw.writeBuffers(bufs)
+	}
 	b := net.Buffers(bufs)
 	_, err := b.WriteTo(c.conn)
 	return err
@@ -627,7 +631,7 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 	}
 	c.isWriting = true
 
-	err := c.write(w.frameType, c.writeDeadline, c.writeBuf[framePos:w.pos], extra)
+	err := c.write(w.frameType, c.getWriteDeadline(), c.writeBuf[framePos:w.pos], extra)
 
 	if !c.isWriting {
 		panic("concurrent write to websocket connection")
@@ -754,7 +758,7 @@ func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {
 		panic("concurrent write to websocket connection")
 	}
 	c.isWriting = true
-	err = c.write(frameType, c.writeDeadline, frameData, nil)
+	err = c.write(frameType, c.getWriteDeadline(), frameData, nil)
 	if !c.isWriting {
 		panic("concurrent write to websocket connection")
 	}
@@ -794,8 +798,17 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 // all future writes will return an error. A zero value for t means writes will
 // not time out.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadlineMu.Lock()
 	c.writeDeadline = t
+	c.writeDeadlineMu.Unlock()
 	return nil
+}
+
+func (c *Conn) getWriteDeadline() time.Time {
+	c.writeDeadlineMu.Lock()
+	t := c.writeDeadline
+	c.writeDeadlineMu.Unlock()
+	return t
 }
 
 // Read methods
@@ -927,6 +940,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		// Don't allow readLength to overflow in the presence of a large readRemaining
 		// counter.
 		if c.readLength < 0 {
+			_ = c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
 			return noFrame, ErrReadLimit
 		}
 
@@ -967,6 +981,9 @@ func (c *Conn) advanceFrame() (int, error) {
 	case CloseMessage:
 		closeCode := CloseNoStatusReceived
 		closeText := ""
+		if len(payload) == 1 {
+			return noFrame, c.handleProtocolError("bad close payload length")
+		}
 		if len(payload) >= 2 {
 			closeCode = int(binary.BigEndian.Uint16(payload))
 			if !isValidReceivedCloseCode(closeCode) {

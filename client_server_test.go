@@ -164,6 +164,36 @@ func sendRecv(t *testing.T, ws *Conn) {
 	}
 }
 
+func hijackConnectTunnel(t *testing.T, w http.ResponseWriter, targetAddr string) {
+	t.Helper()
+	clientConn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		t.Errorf("Hijack: %v", err)
+		return
+	}
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		clientConn.Close()
+		t.Errorf("Dial target: %v", err)
+		return
+	}
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		clientConn.Close()
+		targetConn.Close()
+		return
+	}
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		_, _ = io.Copy(targetConn, brw.Reader)
+	}()
+	go func() {
+		defer clientConn.Close()
+		defer targetConn.Close()
+		_, _ = io.Copy(clientConn, targetConn)
+	}()
+}
+
 func TestProxyDial(t *testing.T) {
 
 	s := newServer(t)
@@ -182,7 +212,7 @@ func TestProxyDial(t *testing.T) {
 		func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodConnect {
 				connect = true
-				w.WriteHeader(http.StatusOK)
+				hijackConnectTunnel(t, w, s.Server.Listener.Addr().String())
 				return
 			}
 
@@ -222,7 +252,7 @@ func TestProxyAuthorizationDial(t *testing.T) {
 			expectedProxyAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("username:password"))
 			if r.Method == http.MethodConnect && proxyAuth == expectedProxyAuth {
 				connect = true
-				w.WriteHeader(http.StatusOK)
+				hijackConnectTunnel(t, w, s.Server.Listener.Addr().String())
 				return
 			}
 

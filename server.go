@@ -90,8 +90,11 @@ func checkSameOrigin(r *http.Request) bool {
 	if len(origin) == 0 {
 		return true
 	}
+	if len(origin) > 1 || r.Host == "" {
+		return false
+	}
 	u, err := url.Parse(origin[0])
-	if err != nil {
+	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false
 	}
 	return equalASCIIFold(u.Host, r.Host)
@@ -115,6 +118,12 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 
 // Upgrade upgrades the HTTP server connection to the WebSocket protocol.
 //
+// Upgrade supports HTTP/1.1 GET handshakes (RFC 6455) as well as HTTP/2
+// (RFC 8441) and HTTP/3 (RFC 9220) Extended CONNECT handshakes. For Go's
+// net/http HTTP/2 server, Extended CONNECT must be enabled via
+// http.HTTP2Config.EnableConnectProtocol (Go 1.28+) or GODEBUG=http2xconnect=1
+// / github.com/c2FmZQ/websocket/h2xconnect (Go 1.24–1.27).
+//
 // The responseHeader is included in the response to the client's upgrade
 // request. Use the responseHeader to specify cookies (Set-Cookie). To specify
 // subprotocols supported by the server, set Upgrader.Subprotocols directly.
@@ -122,6 +131,9 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 // If the upgrade fails, then Upgrade replies to the client with an HTTP error
 // response.
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (*Conn, error) {
+	if r.ProtoMajor >= 2 {
+		return u.upgradeExtendedConnect(w, r, responseHeader)
+	}
 	const badHandshake = "websocket: the client is not using the websocket protocol: "
 
 	if !tokenListContainsValue(r.Header, "Connection", "upgrade") {
@@ -340,8 +352,16 @@ func Subprotocols(r *http.Request) []string {
 }
 
 // IsWebSocketUpgrade returns true if the client requested upgrade to the
-// WebSocket protocol.
+// WebSocket protocol over HTTP/1.1 (Upgrade: websocket) or HTTP/2 / HTTP/3
+// Extended CONNECT (:protocol = websocket).
 func IsWebSocketUpgrade(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.ProtoMajor >= 2 {
+		proto, ok := extendedConnectProtocol(r)
+		return r.Method == http.MethodConnect && ok && equalASCIIFold(proto, "websocket")
+	}
 	return tokenListContainsValue(r.Header, "Connection", "upgrade") &&
 		tokenListContainsValue(r.Header, "Upgrade", "websocket")
 }
@@ -370,4 +390,3 @@ func (b *brNetConn) Read(p []byte) (n int, err error) {
 func (b *brNetConn) NetConn() net.Conn {
 	return b.Conn
 }
-

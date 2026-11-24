@@ -2,42 +2,44 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package websocket implements the WebSocket protocol defined in RFC 6455.
+// Package websocket implements the WebSocket protocol defined in RFC 6455,
+// with server-side support for WebSocket over HTTP/2 (RFC 8441) and HTTP/3
+// (RFC 9220).
 //
-// Overview
+// # Overview
 //
 // The Conn type represents a WebSocket connection. A server application calls
 // the Upgrader.Upgrade method from an HTTP request handler to get a *Conn:
 //
-//  var upgrader = websocket.Upgrader{
-//      ReadBufferSize:  1024,
-//      WriteBufferSize: 1024,
-//  }
+//	var upgrader = websocket.Upgrader{
+//	    ReadBufferSize:  1024,
+//	    WriteBufferSize: 1024,
+//	}
 //
-//  func handler(w http.ResponseWriter, r *http.Request) {
-//      conn, err := upgrader.Upgrade(w, r, nil)
-//      if err != nil {
-//          log.Println(err)
-//          return
-//      }
-//      ... Use conn to send and receive messages.
-//  }
+//	func handler(w http.ResponseWriter, r *http.Request) {
+//	    conn, err := upgrader.Upgrade(w, r, nil)
+//	    if err != nil {
+//	        log.Println(err)
+//	        return
+//	    }
+//	    ... Use conn to send and receive messages.
+//	}
 //
 // Call the connection's WriteMessage and ReadMessage methods to send and
 // receive messages as a slice of bytes. This snippet of code shows how to echo
 // messages using these methods:
 //
-//  for {
-//      messageType, p, err := conn.ReadMessage()
-//      if err != nil {
-//          log.Println(err)
-//          return
-//      }
-//      if err := conn.WriteMessage(messageType, p); err != nil {
-//          log.Println(err)
-//          return
-//      }
-//  }
+//	for {
+//	    messageType, p, err := conn.ReadMessage()
+//	    if err != nil {
+//	        log.Println(err)
+//	        return
+//	    }
+//	    if err := conn.WriteMessage(messageType, p); err != nil {
+//	        log.Println(err)
+//	        return
+//	    }
+//	}
 //
 // In above snippet of code, p is a []byte and messageType is an int with value
 // websocket.BinaryMessage or websocket.TextMessage.
@@ -49,24 +51,24 @@
 // method to get an io.Reader and read until io.EOF is returned. This snippet
 // shows how to echo messages using the NextWriter and NextReader methods:
 //
-//  for {
-//      messageType, r, err := conn.NextReader()
-//      if err != nil {
-//          return
-//      }
-//      w, err := conn.NextWriter(messageType)
-//      if err != nil {
-//          return err
-//      }
-//      if _, err := io.Copy(w, r); err != nil {
-//          return err
-//      }
-//      if err := w.Close(); err != nil {
-//          return err
-//      }
-//  }
+//	for {
+//	    messageType, r, err := conn.NextReader()
+//	    if err != nil {
+//	        return
+//	    }
+//	    w, err := conn.NextWriter(messageType)
+//	    if err != nil {
+//	        return err
+//	    }
+//	    if _, err := io.Copy(w, r); err != nil {
+//	        return err
+//	    }
+//	    if err := w.Close(); err != nil {
+//	        return err
+//	    }
+//	}
 //
-// Data Messages
+// # Data Messages
 //
 // The WebSocket protocol distinguishes between text and binary data messages.
 // Text messages are interpreted as UTF-8 encoded text. The interpretation of
@@ -80,7 +82,7 @@
 // It is the application's responsibility to ensure that text messages are
 // valid UTF-8 encoded text.
 //
-// Control Messages
+// # Control Messages
 //
 // The WebSocket protocol defines three types of control messages: close, ping
 // and pong. Call the connection WriteControl, WriteMessage or NextWriter
@@ -110,16 +112,16 @@
 // in messages from the peer, then the application should start a goroutine to
 // read and discard messages from the peer. A simple example is:
 //
-//  func readLoop(c *websocket.Conn) {
-//      for {
-//          if _, _, err := c.NextReader(); err != nil {
-//              c.Close()
-//              break
-//          }
-//      }
-//  }
+//	func readLoop(c *websocket.Conn) {
+//	    for {
+//	        if _, _, err := c.NextReader(); err != nil {
+//	            c.Close()
+//	            break
+//	        }
+//	    }
+//	}
 //
-// Concurrency
+// # Concurrency
 //
 // Connections support one concurrent reader and one concurrent writer.
 //
@@ -133,7 +135,7 @@
 // The Close and WriteControl methods can be called concurrently with all other
 // methods.
 //
-// Origin Considerations
+// # Origin Considerations
 //
 // Web browsers allow Javascript applications to open a WebSocket connection to
 // any host. It's up to the server to enforce an origin policy using the Origin
@@ -151,7 +153,7 @@
 // checking. The application is responsible for checking the Origin header
 // before calling the Upgrade function.
 //
-// Buffers
+// # Buffers
 //
 // Connections buffer network input and output to reduce the number
 // of system calls when reading or writing messages.
@@ -198,16 +200,16 @@
 // buffer size has a reduced impact on total memory use and has the benefit of
 // reducing system calls and frame overhead.
 //
-// Compression EXPERIMENTAL
+// # Compression EXPERIMENTAL
 //
 // Per message compression extensions (RFC 7692) are experimentally supported
 // by this package in a limited capacity. Setting the EnableCompression option
 // to true in Dialer or Upgrader will attempt to negotiate per message deflate
 // support.
 //
-//  var upgrader = websocket.Upgrader{
-//      EnableCompression: true,
-//  }
+//	var upgrader = websocket.Upgrader{
+//	    EnableCompression: true,
+//	}
 //
 // If compression was successfully negotiated with the connection's peer, any
 // message received in compressed form will be automatically decompressed.
@@ -216,7 +218,7 @@
 // Per message compression of messages written to a connection can be enabled
 // or disabled by calling the corresponding Conn method:
 //
-//  conn.EnableWriteCompression(false)
+//	conn.EnableWriteCompression(false)
 //
 // Currently this package does not support compression with "context takeover".
 // This means that messages must be compressed and decompressed in isolation,
@@ -224,4 +226,21 @@
 // more details refer to RFC 7692.
 //
 // Use of compression is experimental and may result in decreased performance.
+//
+// # HTTP/2 and HTTP/3
+//
+// Upgrader.Upgrade transparently accepts HTTP/1.1 GET upgrades (RFC 6455) as
+// well as HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) Extended CONNECT requests,
+// returning a *Conn in all cases. When using method-specific http.ServeMux
+// patterns, register both GET and CONNECT handlers for WebSocket routes, and
+// keep the http.Handler running for the lifetime of the WebSocket session.
+//
+// Go's standard library net/http server disables HTTP/2 Extended CONNECT by
+// default starting in Go 1.24:
+//
+//   - Go 1.28+ (https://go.dev/issue/53208, golang/go commit e29e95265674):
+//     set HTTP2Config.EnableConnectProtocol = true on http.Server.HTTP2.
+//   - Go 1.24–1.27: set GODEBUG=http2xconnect=1 in the environment at startup,
+//     or blank-import github.com/c2FmZQ/websocket/h2xconnect before any package
+//     that imports net/http.
 package websocket
