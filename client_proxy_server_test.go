@@ -637,7 +637,7 @@ var websocketEchoHandler = http.HandlerFunc(func(w http.ResponseWriter, req *htt
 	}
 	wsConn, err := upgrader.Upgrade(w, req, nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	defer wsConn.Close()
 	for {
@@ -708,19 +708,24 @@ var proxyHandler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Reques
 		return
 	}
 	defer upstream.Close()
-	// Return 200 OK to client.
-	w.WriteHeader(http.StatusOK)
-	// Hijack client connection.
-	client, _, err := w.(http.Hijacker).Hijack()
+	// Hijack client connection before writing the 200 OK tunnel response so
+	// net/http's background reader cannot consume initial tunneled bytes.
+	client, brw, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer client.Close()
+	if _, err := brw.WriteString("HTTP/1.1 200 OK\r\n\r\n"); err != nil {
+		return
+	}
+	if err := brw.Flush(); err != nil {
+		return
+	}
 	// Create duplex streaming between client and upstream connections.
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(upstream, client)
+		_, _ = io.Copy(upstream, brw)
 		done <- struct{}{}
 	}()
 	go func() {
@@ -756,6 +761,7 @@ func newProxyServer(tlsServer bool) (counter, *url.URL, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	ts.server = proxyServer
 	return ts, proxyURL, nil
 }
 

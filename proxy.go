@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,6 +56,8 @@ func (hpd *httpProxyDialer) DialContext(ctx context.Context, network string, add
 	if err != nil {
 		return nil, err
 	}
+	stopAbort := abortOnCancel(ctx, conn)
+	defer stopAbort()
 
 	connectHeader := make(http.Header)
 	if user := hpd.proxyURL.User; user != nil {
@@ -73,16 +76,20 @@ func (hpd *httpProxyDialer) DialContext(ctx context.Context, network string, add
 
 	if err := connectReq.Write(conn); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, ctxErrOr(ctx, err)
 	}
 
 	// Read response. It's OK to use and discard buffered reader here because
 	// the remote server does not speak until spoken to.
-	br := bufio.NewReader(conn)
+	limitedConn := &io.LimitedReader{R: conn, N: maxHandshakeResponseSize}
+	br := bufio.NewReader(limitedConn)
 	resp, err := http.ReadResponse(br, connectReq)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		if limitedConn.N <= 0 {
+			return nil, errHandshakeResponseTooLarge
+		}
+		return nil, ctxErrOr(ctx, err)
 	}
 
 	// Close the response body to silence false positives from linters. Reset
@@ -97,8 +104,15 @@ func (hpd *httpProxyDialer) DialContext(ctx context.Context, network string, add
 
 	if resp.StatusCode != http.StatusOK {
 		_ = conn.Close()
-		f := strings.SplitN(resp.Status, " ", 2)
-		return nil, errors.New(f[1])
+		_, msg, ok := strings.Cut(resp.Status, " ")
+		if !ok || msg == "" {
+			msg = resp.Status
+		}
+		return nil, errors.New(msg)
+	}
+	if err := stopAbort(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	return conn, nil
 }

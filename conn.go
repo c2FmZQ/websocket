@@ -405,6 +405,9 @@ func (c *Conn) write(frameType int, deadline time.Time, buf0, buf1 []byte) error
 }
 
 func (c *Conn) writeBufs(bufs ...[]byte) error {
+	if bw, ok := c.conn.(buffersWriter); ok {
+		return bw.writeBuffers(bufs)
+	}
 	b := net.Buffers(bufs)
 	_, err := b.WriteTo(c.conn)
 	return err
@@ -830,7 +833,7 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	c.readDecompress = false
 	if rsv1 {
-		if c.newDecompressionReader != nil {
+		if c.newDecompressionReader != nil && (frameType == TextMessage || frameType == BinaryMessage) {
 			c.readDecompress = true
 		} else {
 			errors = append(errors, "RSV1 set")
@@ -927,6 +930,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		// Don't allow readLength to overflow in the presence of a large readRemaining
 		// counter.
 		if c.readLength < 0 {
+			_ = c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
 			return noFrame, ErrReadLimit
 		}
 
@@ -967,6 +971,9 @@ func (c *Conn) advanceFrame() (int, error) {
 	case CloseMessage:
 		closeCode := CloseNoStatusReceived
 		closeText := ""
+		if len(payload) == 1 {
+			return noFrame, c.handleProtocolError("bad close payload length")
+		}
 		if len(payload) >= 2 {
 			closeCode = int(binary.BigEndian.Uint16(payload))
 			if !isValidReceivedCloseCode(closeCode) {
@@ -1028,6 +1035,13 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
+				if c.readLimit > 0 {
+					c.reader = &limitedDecompressReader{
+						c:         c,
+						rc:        c.reader,
+						remaining: c.readLimit,
+					}
+				}
 			}
 			return frameType, c.reader, nil
 		}
@@ -1097,6 +1111,41 @@ func (r *messageReader) Close() error {
 	return nil
 }
 
+type limitedDecompressReader struct {
+	c         *Conn
+	rc        io.ReadCloser
+	remaining int64
+}
+
+func (r *limitedDecompressReader) Read(p []byte) (int, error) {
+	if r.c.readErr != nil {
+		return 0, r.c.readErr
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.remaining == 0 {
+		var probe [1]byte
+		n, err := r.rc.Read(probe[:])
+		if n > 0 {
+			_ = r.c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
+			r.c.readErr = ErrReadLimit
+			return 0, ErrReadLimit
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.rc.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+func (r *limitedDecompressReader) Close() error {
+	return r.rc.Close()
+}
+
 // ReadMessage is a helper method for getting a reader using NextReader and
 // reading from that reader to a buffer.
 func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
@@ -1119,7 +1168,12 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetReadLimit sets the maximum size in bytes for a message read from the peer. If a
 // message exceeds the limit, the connection sends a close message to the peer
-// and returns ErrReadLimit to the application.
+// and returns ErrReadLimit to the application. When compression is in use, the
+// limit applies to both the compressed and the decompressed size.
+//
+// The default is no limit. Applications that read messages from untrusted
+// peers should set a limit, especially when compression is enabled: a small
+// compressed message can expand to roughly a thousand times its size.
 func (c *Conn) SetReadLimit(limit int64) {
 	c.readLimit = limit
 }

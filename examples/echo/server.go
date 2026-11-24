@@ -13,7 +13,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/gorilla/websocket"
+	"github.com/c2FmZQ/websocket"
 )
 
 var addr = flag.String("addr", "localhost:8080", "http service address")
@@ -27,6 +27,7 @@ func echo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.Close()
+	c.SetReadLimit(64 << 10)
 	for {
 		mt, message, err := c.ReadMessage()
 		if err != nil {

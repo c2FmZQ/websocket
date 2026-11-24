@@ -14,9 +14,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gorilla/websocket"
+	"github.com/c2FmZQ/websocket"
 )
 
+// upgrader is configured for the Autobahn test suite, which sends messages
+// of up to 16 MB from any origin. Do not copy this configuration into a
+// production server: it accepts cross-origin connections and sets no read
+// limit, so a small compressed message can expand to a very large one.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:    4096,
 	WriteBufferSize:   4096,
