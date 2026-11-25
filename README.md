@@ -1,3 +1,6 @@
+[![Tests](https://github.com/c2FmZQ/websocket/actions/workflows/pr.yml/badge.svg)](https://github.com/c2FmZQ/websocket/actions/workflows/pr.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/c2FmZQ/websocket.svg)](https://pkg.go.dev/github.com/c2FmZQ/websocket)
+
 # WebSocket (`github.com/c2FmZQ/websocket`)
 
 `github.com/c2FmZQ/websocket` is a fork of [gorilla/websocket](https://github.com/gorilla/websocket) that adds server-side support for:
